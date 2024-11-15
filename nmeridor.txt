@@ -1,0 +1,138 @@
+from AlgorithmImports import *
+from datetime import timedelta
+
+class EnhancedTradingAlgorithm(QCAlgorithm):
+    def Initialize(self):
+        # Set start and end date for backtest
+        self.SetStartDate(2012, 1, 1)
+        self.SetEndDate(2024, 10, 1)
+        
+        # Set starting capital
+        self.SetCash(100000)
+        
+        # Add BRKB symbol with minute resolution (can be switched as needed)
+        self.brkb = self.AddEquity("BRKB", Resolution.Minute).Symbol
+        
+        # Choose the time resolution here (minute, hour, second)
+        self.time_resolution = Resolution.Hour  # Change as needed
+        
+        # Create indicators for BRKB
+        self.sma = SimpleMovingAverage(100)
+        self.rsi = RelativeStrengthIndex(14, MovingAverageType.Wilders)
+        self.adx = AverageDirectionalIndex(14)
+        self.ad = AccumulationDistribution(self.brkb)
+        
+        # Register indicators based on selected resolution
+        self.RegisterIndicator(self.brkb, self.sma, self.time_resolution)
+        self.RegisterIndicator(self.brkb, self.rsi, self.time_resolution)
+        self.RegisterIndicator(self.brkb, self.adx, self.time_resolution)
+        self.RegisterIndicator(self.brkb, self.ad, self.time_resolution)
+        
+        # Initialize stop-loss, take-profit variables
+        self.entry_price = None
+        self.stop_loss_price = None
+        self.take_profit_price = None
+        
+        # Set thresholds
+        self.rsi_buy_tolerance = 33
+        self.rsi_sell_tolerance = 83
+        self.sma_tolerance = 2.0
+        self.adx_tolerance = 10
+        self.stop_loss_percentage = 0.09
+        self.take_profit_percentage = 0.19
+        
+        # Set up monthly trading restrictions
+        self.excluded_months = [9, 10]  # September and October
+
+        # Add warm-up to cover 100 periods
+        self.SetWarmUp(timedelta(days=67))
+
+    def OnData(self, data):
+        # Check if data is available for BRKB
+        if not data.Bars.ContainsKey(self.brkb) or self.IsWarmingUp:
+            return
+        
+        # Get the current date and month
+        current_date = self.Time
+        current_month = current_date.month
+        current_day = current_date.day
+
+        # Liquidate portfolio at the end of August
+        if current_month == 8 and current_day >= 31:
+            self.Liquidate()
+            self.Debug(f"Portfolio liquidated at the end of August ({current_date.strftime('%Y-%m-%d')})")
+            return
+
+        # Skip trading in the excluded months
+        if current_month in self.excluded_months:
+            self.Debug(f"Skipping trading for {current_date.strftime('%B')} ({current_month})")
+            return
+        
+        # Get the current price and indicator values for BRKB
+        current_price_brkb = float(data[self.brkb].Price)
+        sma_value = self.sma.Current.Value
+        rsi_value = self.rsi.Current.Value
+        adx_value = self.adx.Current.Value
+        ad_value = self.ad.Current.Value
+        
+        # Check if we are invested
+        invested_brkb = self.Portfolio[self.brkb].Invested
+        
+        # Convert stop-loss and take-profit prices to float for comparison
+        stop_loss_price_float = float(self.stop_loss_price) if self.stop_loss_price is not None else None
+        take_profit_price_float = float(self.take_profit_price) if self.take_profit_price is not None else None
+
+        # Debugging output for traceability
+        self.Debug(f"BRKB Price: {current_price_brkb}, SMA: {sma_value}, RSI: {rsi_value}, ADX: {adx_value}, A/D: {ad_value}, Invested BRKB: {invested_brkb}")
+        
+        # Buy condition
+        if (rsi_value < self.rsi_buy_tolerance and
+            current_price_brkb >= sma_value - self.sma_tolerance and
+            adx_value > self.adx_tolerance and
+            ad_value > 0 and
+            not invested_brkb):
+            
+            self.SetHoldings(self.brkb, 1.0)
+            self.entry_price = current_price_brkb
+            
+            # Set stop-loss and take-profit levels
+            self.stop_loss_price = self.entry_price * (1 - self.stop_loss_percentage)
+            self.take_profit_price = self.entry_price * (1 + self.take_profit_percentage)
+            
+            self.Debug(f"Bought BRKB at {current_price_brkb}. Stop-Loss: {self.stop_loss_price}, Take-Profit: {self.take_profit_price}")
+        
+        # Sell conditions
+        if invested_brkb:
+            if stop_loss_price_float is not None and current_price_brkb < stop_loss_price_float:
+                self.Liquidate(self.brkb)
+                self.Debug(f"Sold BRKB at {current_price_brkb} due to stop-loss at {stop_loss_price_float}")
+                self.entry_price = None
+                self.stop_loss_price = None
+                self.take_profit_price = None
+
+            elif take_profit_price_float is not None and current_price_brkb > take_profit_price_float:
+                self.Liquidate(self.brkb)
+                self.Debug(f"Sold BRKB at {current_price_brkb} due to take-profit at {take_profit_price_float}")
+                self.entry_price = None
+                self.stop_loss_price = None
+                self.take_profit_price = None
+
+            elif rsi_value > self.rsi_sell_tolerance:
+                self.Liquidate(self.brkb)
+                self.Debug(f"Sold BRKB at {current_price_brkb} due to RSI > {self.rsi_sell_tolerance}")
+                self.entry_price = None
+                self.stop_loss_price = None
+                self.take_profit_price = None
+
+    def OnEndOfDay(self):
+        # Debug output for end-of-day information
+        debug_message = (f"{self.Time} - BRKB Price: {self.Securities[self.brkb].Price}, "
+                         f"SMA: {self.sma.Current.Value}, RSI: {self.rsi.Current.Value}, "
+                         f"ADX: {self.adx.Current.Value}, A/D Line: {self.ad.Current.Value}")
+        self.Debug(debug_message)
+
+    def OnOrderEvent(self, orderEvent):
+        # Handle order events for debugging purposes
+        if orderEvent.Status == OrderStatus.Filled:
+            self.Debug(f"Order {orderEvent.OrderId} filled for {orderEvent.Symbol} at {orderEvent.FillPrice}")
+

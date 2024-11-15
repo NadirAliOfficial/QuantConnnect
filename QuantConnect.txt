@@ -1,0 +1,253 @@
+from AlgorithmImports import *
+from collections import deque
+import numpy as np
+from scipy import stats
+import pandas as pd
+
+class ModifiedMomentumPercent:
+    def __init__(self, algorithm, symbol, period):
+        self.algorithm = algorithm
+        self.Symbol = symbol
+        self.Period = period
+        self.data_points = deque(maxlen=period)  # Store price data points
+        self.Time = datetime.min
+        self.Value = 0
+        self.IsReady = False
+        self.WarmUpPeriod = period
+        self.last_update = datetime.min
+        self.last_close = None
+        self.Current = IndicatorDataPoint(symbol, datetime.min, 0)
+        self.trading_day_counter = 0
+        self.last_trading_day = None
+
+    def UpdateData(self, input):
+        current_date = input.EndTime.date()
+        if self.last_trading_day is None or current_date > self.last_trading_day:
+            self.trading_day_counter += 1
+            self.last_trading_day = current_date
+
+        self.data_points.append((self.trading_day_counter, input.Value))
+        self.last_update = input.EndTime
+        self.last_close = input.Value
+
+        if len(self.data_points) == self.Period:
+            self.CalculateMomentum()
+
+        return self.IsReady
+
+    def CalculateMomentum(self):
+        if len(self.data_points) < self.Period:
+            return 0
+        
+        trading_days, prices = zip(*self.data_points)
+        
+        if len(set(trading_days)) < 2:
+            return 0
+        
+        log_prices = np.log(prices)
+        slope, intercept, r_value, p_value, std_err = stats.linregress(trading_days, log_prices)
+
+        if np.isnan(slope) or abs(slope) < 1e-25:
+            return 0
+        
+        trading_days_per_year = 252
+        r_squared = r_value ** 2
+        annualized_return = (np.exp(slope * trading_days_per_year) - 1)
+        result = annualized_return * 100 * r_squared
+
+        self.Value = result
+        self.IsReady = True
+        self.Current = IndicatorDataPoint(self.Symbol, self.last_update, self.Value)
+
+        return result
+
+    def Reset(self):
+        self.data_points.clear()
+        self.Value = 0
+        self.IsReady = False
+        self.last_update = datetime.min
+        self.last_close = None
+        self.Current = IndicatorDataPoint(self.Symbol, datetime.min, 0)
+        self.trading_day_counter = 0
+        self.last_trading_day = None
+
+
+class SPYConstituentsMomentumStrategy(QCAlgorithm):
+
+    def Initialize(self):
+        # Set start and end dates for the backtest
+        self.SetStartDate(2024, 1, 1)
+        self.SetEndDate(2024, 3, 6)
+        self.SetCash(100000)  # Set initial capital
+
+        # Define strategy parameters
+        self._lookback = 30
+        self._atr_period = 20
+        self._stock_sma_period = 50
+        self._slow_sma_period = 50
+        self._fast_sma_period = 21
+        self._warm_up_period = max(self._lookback, self._atr_period, self._stock_sma_period, 
+                                   self._slow_sma_period, self._fast_sma_period) + 10
+
+        # Set universe settings
+        self.UniverseSettings.Resolution = Resolution.Daily
+        self.UniverseSettings.Asynchronous = False
+
+        # Initialize dictionaries to store indicators
+        self._momentum = {}
+        self._atr = {}
+        self._stock_sma = {}
+
+        # Define other strategy parameters
+        self._risk_per_trade = 0.003
+        self._quintile = 0.1
+        self._leverage_multiplier = 2
+        self._rebalance_period = timedelta(days=60)
+
+        # Add SPY and create indicators
+        self.spy = self.AddEquity("SPY", Resolution.Daily).Symbol
+        self.spy_slow_sma = self.SMA(self.spy, self._slow_sma_period, Resolution.Daily)
+        self.spy_fast_sma = self.SMA(self.spy, self._fast_sma_period, Resolution.Daily)
+        self.spy_atr = self.ATR(self.spy, self._atr_period, MovingAverageType.Simple)
+
+        # Add universe selection before setting warm-up
+        self.AddUniverseSelection(ETFConstituentsUniverseSelectionModel("SPY"))
+
+        # Set warm-up period after adding universe
+        self.SetWarmUp(TimeSpan.FromDays(self._warm_up_period), Resolution.Daily)
+
+        # Set brokerage model and benchmark
+        self.SetBrokerageModel(BrokerageName.InteractiveBrokersBrokerage, AccountType.Margin)
+        self.SetBenchmark("SPY")
+
+        self.is_leveraged = False
+        self._last_rebalance = None
+        self._is_first_rebalance = True
+
+        # Schedule the initial warm-up of indicators
+        self.Schedule.On(self.DateRules.On(self.StartDate), self.TimeRules.AfterMarketOpen("SPY"), self.InitialWarmUp)
+
+        self.Log("Initialization completed")
+
+    def InitialWarmUp(self):
+        if self.IsWarmingUp:
+            self.WarmUpSPYIndicators()
+            self.WarmUpStockIndicators(self.Universe.Keys)
+            self.Log(f"Warmed up indicators for SPY and {len(self.Universe.Keys)} stocks")
+
+    def WarmUpSPYIndicators(self):
+        history = self.History(self.spy, self._warm_up_period, Resolution.Daily)
+        if not history.empty:
+            for datapoint in history.itertuples():
+                self.spy_slow_sma.Update(datapoint.Index[1], datapoint.close)
+                self.spy_fast_sma.Update(datapoint.Index[1], datapoint.close)
+            self.Log("SPY indicators warmed up successfully")
+        else:
+            self.Log("No historical data available for SPY")
+
+    def WarmUpStockIndicators(self, symbols):
+        if not symbols:
+            self.Log("No symbols to warm up")
+            return
+
+        history = self.History[TradeBar](symbols, self._warm_up_period, Resolution.Daily)
+        for bars in history:
+            for symbol, bar in bars.items():
+                if symbol not in self._momentum:
+                    self._momentum[symbol] = ModifiedMomentumPercent(self, symbol, self._lookback)
+                    self._atr[symbol] = self.ATR(symbol, self._atr_period, MovingAverageType.Simple)
+                    self._stock_sma[symbol] = self.SMA(symbol, self._stock_sma_period)
+
+                self._momentum[symbol].UpdateData(IndicatorDataPoint(symbol, bar.end_time, bar.close))
+                self._atr[symbol].Update(bar)
+                self._stock_sma[symbol].Update(bar.end_time, bar.close)
+                
+        for symbol, momentum in self._momentum.items():
+            momentum.CalculateMomentum()
+        self.Log(f"Warmed up indicators for {len(symbols)} symbols")
+        if len(list(history)) == 0:
+            self.Log(f"No historical data available for {len(symbols)} symbols")
+
+    def OnSecuritiesChanged(self, changes):
+        # Handle changes in the securities universe
+        for security in changes.RemovedSecurities:
+            symbol = security.Symbol
+            if symbol in self._momentum:
+                self.Liquidate(symbol)
+                del self._momentum[symbol]
+            if symbol in self._atr:
+                del self._atr[symbol]
+            if symbol in self._stock_sma:
+                del self._stock_sma[symbol]
+
+        added_symbols = [security.Symbol for security in changes.AddedSecurities]
+        if added_symbols:
+            self.WarmUpStockIndicators(added_symbols)
+
+    def OnData(self, data):
+        if self.IsWarmingUp:
+            return
+
+        # Update data points for momentum indicators daily
+        for symbol, indicator in self._momentum.items():
+            if symbol in data and data[symbol] is not None:
+                indicator.UpdateData(IndicatorDataPoint(symbol, self.Time, data[symbol].Close))
+
+        # Check if it's time to rebalance
+        if self._last_rebalance is None or (self.Time - self._last_rebalance) >= self._rebalance_period or self._is_first_rebalance:
+            self._last_rebalance = self.Time
+            self._is_first_rebalance = False
+
+            # Calculate momentum for all symbols on rebalancing day
+            for indicator in self._momentum.values():
+                indicator.CalculateMomentum()
+
+            if not self.spy_slow_sma.IsReady or not self.spy_fast_sma.IsReady or not self.spy_atr.IsReady:
+                self.Log(f"SPY indicators not ready. FastSMA: {self.spy_fast_sma.IsReady}, SlowSMA: {self.spy_slow_sma.IsReady}, ATR: {self.spy_atr.IsReady}")
+                return
+
+            # Calculate and rank momentum for all stocks in the universe
+            momentum_values = {symbol: indicator.Value for symbol, indicator in self._momentum.items() if indicator.IsReady}
+            if len(momentum_values) == 0:
+                self.Log("No momentum values available for rebalancing")
+                return
+
+            quintile_threshold = int(len(momentum_values) * (1 - self._quintile))
+            top_stocks = sorted(momentum_values.items(), key=lambda x: x[1], reverse=True)[:quintile_threshold]
+
+            if len(top_stocks) == 0:
+                self.Log("No top stocks to trade")
+                return
+
+            # Determine the weight for each stock
+            if self.spy_fast_sma.Current.Value > self.spy_slow_sma.Current.Value:
+                self.is_leveraged = True
+                stock_weight = self._leverage_multiplier * self._risk_per_trade * self.Portfolio.TotalPortfolioValue
+            else:
+                self.is_leveraged = False
+                stock_weight = self._risk_per_trade * self.Portfolio.TotalPortfolioValue
+
+            # Ensure we do not exceed available buying power
+            total_weight = stock_weight / len(top_stocks)
+            total_order_value = total_weight * len(top_stocks)
+            available_buying_power = self.Portfolio.TotalPortfolioValue - self.Portfolio.TotalMarginUsed
+
+            if total_order_value > available_buying_power:
+                self.Log("Insufficient buying power. Reducing position sizes.")
+                stock_weight = available_buying_power / len(top_stocks)
+
+            # Rebalance the portfolio
+            self.Log(f"Rebalancing portfolio on {self.Time}")
+            for symbol, _ in top_stocks:
+                stop_loss_level = data[symbol].Close - self._atr[symbol].Current.Value * 2
+                self.SetHoldings(symbol, stock_weight / len(top_stocks))
+                self.StopMarketOrder(symbol, self.Portfolio[symbol].Quantity, stop_loss_level)
+                self.Log(f"Placed order for {symbol} with stop loss at {stop_loss_level}")
+
+            self.Log(f"Rebalanced portfolio with top {len(top_stocks)} stocks")
+
+    def OnOrderEvent(self, order_event):
+        # Log the details of each order event
+        if order_event.Status == OrderStatus.Filled:
+            self.Log(f"Order filled: {order_event.Symbol} | Quantity: {order_event.FillQuantity} | Fill Price: {order_event.FillPrice}")
+

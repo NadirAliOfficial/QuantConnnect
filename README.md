@@ -15,3 +15,4 @@ lean backtest "Strategy Name"
 
 ## License
 MIT
+<!-- updated: 2026-01-12-02 -->
